@@ -2,6 +2,71 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## This fork
+
+A self-hosted fork of SupoClip for GTA gaming clips. The main new work is gaming highlight scoring
+(so quiet gameplay moments can be picked, not only what the transcript says), Instagram posting, and
+a review queue every clip passes before it posts. Full plan and phases: `docs/PLAN.md`.
+
+**Personal use only:** one user (the repo owner) posting to their own accounts. Don't build
+multi-user, billing or onboarding features.
+
+Everything below the line describes upstream SupoClip. Its hosted-only parts (plans and billing, the
+Creator program, the iOS app, Stripe) don't apply to this fork.
+
+### Run it
+
+```bash
+cp .env.example .env          # then fill in the keys below
+docker-compose up -d --build
+```
+
+Open http://localhost:3107 and create an account. The API is at http://localhost:8000 (docs at `/docs`).
+
+`.env` keys:
+- **Transcription:** `TRANSCRIPTION_PROVIDER=whisper` (local, no key; size via `WHISPER_MODEL_SIZE`)
+  or `assemblyai` with `ASSEMBLY_AI_API_KEY`.
+- **LLM:** `LLM=provider:model` plus that provider's key (`OPENROUTER_API_KEY`, `OPENAI_API_KEY`,
+  `GOOGLE_API_KEY` or `ANTHROPIC_API_KEY`), or `LLM=ollama:<model>` with no key.
+- **Auth:** `BETTER_AUTH_SECRET` and `BACKEND_AUTH_SECRET`; keep `SELF_HOST=true`.
+- **Platforms:** `SOCIAL_PUBLISHING_ACCESS=all` (the default `off` hides posting),
+  `INSTAGRAM_APP_ID`/`INSTAGRAM_APP_SECRET`, later `YOUTUBE_OAUTH_CLIENT_ID`/`_SECRET` and
+  `TIKTOK_CLIENT_KEY`/`_SECRET`. Instagram fetches each video from `SOCIAL_PUBLIC_MEDIA_BASE_URL`
+  (default `NEXT_PUBLIC_APP_URL`), so that has to be a public URL, not localhost.
+
+### Rules for changes
+
+- **New code goes in its own modules**, such as `backend/src/gaming_scoring/`, `backend/src/review/`
+  and `backend/src/publishing/`, not in SupoClip's files. Where upstream code has to change, keep it
+  to a small hook that calls the new module, so merges from upstream stay easy.
+- **All posting code sits behind one interface**, so the posting service (a third-party posting API
+  at first, see `docs/PLAN.md`) can be swapped for our own platform API access later. Upstream's
+  per-platform providers implement `SocialProvider` in `backend/src/social/base.py`.
+- **Never commit API keys or OAuth tokens.** They go in `.env` (gitignored); `.env.example` gets
+  empty placeholders only.
+
+### Testing
+
+Check every scoring or clip change against the 3–5 benchmark GTA videos in `benchmarks/videos/`
+(gitignored; GTA V / GTA Online streams and recordings, phase 2 of `docs/PLAN.md`): compare which
+moments get picked before and after, and record good, bad and missed clips in `benchmarks/NOTES.md`.
+Upstream's test suites are under Development Commands → Tests below.
+
+### Upstream
+
+`upstream` is FujiwaraChoki/supoclip (already a remote); `origin` is LiansTech/hippo. Merge from it
+regularly:
+
+```bash
+git fetch upstream && git merge upstream/main
+```
+
+**Push and open PRs only on `origin` (LiansTech/hippo), never on upstream.** The repo is a GitHub
+fork, so `gh` may target the parent: always run `gh pr create --repo LiansTech/hippo --base main`.
+Pushing to `upstream` is disabled locally (its push URL is a placeholder).
+
+---
+
 ## Project Overview
 
 SupoClip is an open-source alternative to OpusClip — an AI-powered video clipping tool that transforms long-form content into viral short clips. AGPL-3.0 licensed.
@@ -11,7 +76,7 @@ SupoClip is an open-source alternative to OpusClip — an AI-powered video clipp
 ### Docker (recommended)
 
 ```bash
-docker-compose up -d              # Start all 6 services
+docker-compose up -d              # Start the default services
 docker-compose up -d --build      # Rebuild after changes
 docker-compose logs -f backend    # Debug backend
 docker-compose logs -f worker     # Debug video processing
@@ -19,7 +84,8 @@ docker-compose logs -f ai-worker  # Debug AI editing in the clip studio
 docker-compose down               # Stop all services
 ```
 
-Services: Frontend (:3107), Backend API (:8000, docs at /docs), Worker (ARQ), AI worker (ARQ, `supoclip_ai` queue), PostgreSQL (:5432), Redis (:6379)
+Default services: Frontend (:3107), Backend API (:8000, docs at /docs), MCP (:9100, HTTP transport), Worker (ARQ; also runs the cron worker), AI worker (ARQ, `supoclip_ai` queue), PostgreSQL (:5432), Redis (:6379).
+Optional profiles: `cron` (separate `cron-worker`; then set `EMBED_CRON_WORKER=0`), `youtube-proxy` (`bgutil` PO tokens), `axiom` (`vector` log shipping).
 
 ### Backend (local)
 
@@ -30,7 +96,7 @@ cd backend
 uv venv .venv && source .venv/bin/activate
 uv sync
 
-# API server (uses refactored entry point)
+# API server (applies pending SQL migrations on startup)
 uvicorn src.main:app --reload --host 0.0.0.0 --port 8000
 
 # Worker process (required for video processing). Also starts the cron worker.
@@ -50,11 +116,24 @@ pnpm run lint
 ### Tests
 
 ```bash
+make check        # frontend lint + typecheck (same as CI)
+make test         # backend pytest + frontend vitest with coverage
+make test-e2e     # Playwright against a real database (runs prisma migrate deploy first)
+
 cd backend && .venv/bin/pytest                  # unit + integration (needs Postgres/Redis; TEST_DATABASE_URL)
-cd backend && .venv/bin/pytest --no-cov tests/unit/test_workflow_options.py   # one file (coverage gate is in addopts)
-cd frontend && pnpm run test                    # vitest; pnpm run lint && pnpm exec tsc --noEmit
+cd backend && .venv/bin/pytest --no-cov tests/unit/test_workflow_options.py -k name   # one file/test
+cd frontend && pnpm run test                    # vitest
+cd frontend && pnpm exec vitest run src/lib/changelog.test.ts   # one file
+cd frontend && pnpm run typecheck               # prisma generate + tsc --noEmit
+cd frontend && pnpm run test:polish             # Playwright with mocked APIs, no database
 cd mcp && uv run --with pytest pytest tests -q
 ```
+
+- The backend coverage gate (`--cov-fail-under=65` on `auth_headers` and `billing_service`) lives in
+  `addopts`, so running a subset without `--no-cov` fails. Media tests need `ffmpeg` on PATH.
+- DB-backed backend tests skip unless `TEST_DATABASE_URL` or `DATABASE_URL` is set; use a dedicated
+  test database. The Makefile defaults to the local `supoclip` database.
+- `backend/tests/live/` holds opt-in checks against real providers and local services (`docs/testing-local.md`).
 
 ## Architecture
 
@@ -78,6 +157,7 @@ services/            → Business logic (task_service.py, video_service.py)
 repositories/        → Raw SQL via asyncpg (task_repository.py, clip_repository.py, source_repository.py)
 workers/             → ARQ job queue (tasks.py, job_queue.py, progress.py)
 utils/               → Thread pool helpers for blocking operations (async_helpers.py)
+media/               → Transcription, captions, timeline, reframing/face detection, ffmpeg helpers
 ```
 
 **Key patterns:**
@@ -102,7 +182,8 @@ utils/               → Thread pool helpers for blocking operations (async_help
    - Optional transition effects (`backend/transitions/`)
    - Optional B-roll overlays (Pexels API)
    - Caption templates with animation styles
-5. **Storage** → Clips to `{TEMP_DIR}/clips/`, metadata to PostgreSQL
+5. **Storage** → Rendered under `{TEMP_DIR}/clips/`, then stored through `media_storage.py` (local disk or
+   S3 bucket per `MEDIA_STORAGE`, see `docs/media-storage.md`); metadata to PostgreSQL
 
 ### Frontend Architecture
 
@@ -124,15 +205,25 @@ PostgreSQL 15. Schema in `init.sql`. Mixed naming conventions:
 - UUIDs stored as VARCHAR(36)
 - Auto-update triggers on `updated_at`/`updatedAt` columns
 
+**Schema changes** have two migration tracks:
+- `backend/src/migrations/sql/*.sql` (`YYYYMMDD_NNNN_name.sql`) run automatically at API startup
+  (`init_db` in `database.py`, recorded in `schema_migrations`). The runner splits on `;`, so avoid
+  semicolons inside statements (e.g. function bodies).
+- `frontend/prisma/migrations/` plus `schema.prisma` for tables the frontend reads through Prisma,
+  applied with `prisma migrate deploy` (a manual deploy step, see `DEPLOY_NOTES.md`).
+- A table both sides use (e.g. `feature_flags`) needs both migrations; a backend-only table
+  (e.g. `editor_sessions`) needs only the SQL one. `init.sql` runs only when the Postgres volume is
+  first created and is not fully in sync; the migrations are the source of truth.
+
 ## Key Backend Files
 
 | File | Purpose |
 |------|---------|
 | `src/main_refactored.py` | Compatibility import for existing deployments |
 | `src/main.py` | Canonical FastAPI application factory |
-| `src/api/routes/tasks.py` | Task CRUD, SSE progress, clip editing endpoints (711 lines) |
+| `src/api/routes/tasks.py` | Task CRUD, SSE progress, clip editing endpoints |
 | `src/api/routes/media.py` | Fonts, transitions, uploads, templates |
-| `src/services/task_service.py` | Task orchestration, clip editing logic (574 lines) |
+| `src/services/task_service.py` | Task orchestration, clip editing logic |
 | `src/services/video_service.py` | Video download, transcription, AI analysis, clip generation |
 | `src/workers/tasks.py` | ARQ worker task definitions |
 | `src/workers/job_queue.py` | Job queue management |
@@ -143,7 +234,8 @@ PostgreSQL 15. Schema in `init.sql`. Mixed naming conventions:
 | `src/local_volume.py` | Id of the disk behind `TEMP_DIR`; tags rows that name a local path |
 | `src/media_replication_ledger.py`, `src/sync_db.py` | Pending two-bucket replication in PostgreSQL, usable from boto threads |
 | `src/ai.py` | Pydantic AI agents, system prompt, segment validation |
-| `src/video_utils.py` | Video processing, cropping, subtitles (~820 lines) |
+| `src/video_utils.py` | Video processing, cropping, subtitles |
+| `src/media_storage.py` | Local/S3 storage of uploads, clips, transcripts and editor media |
 | `src/clip_editor.py` | Clip trim, split, merge, export presets |
 | `src/editor_document.py` | Clip studio draft model (segments, words, captions, framing, B-roll) and server render |
 | `src/workflows/` | Workflows (series, topic, recap, trailer): contracts, options/gate, units, outline, planners, solvers |
@@ -262,6 +354,18 @@ table (one per user, `slug` cleared on decline).
 When a change gives existing users something new to find, add a tour: an entry in
 `frontend/src/lib/feature-tours.ts`, `data-tour` on its target, and text in
 `frontend/messages/*/tours.json`. Explain the feature, don't just point at it. Rules and steps: `docs/feature-tours.md`.
+
+## Repository conventions
+
+From `AGENTS.md` (full PR checklist and deploy rules there):
+
+- **Changelog:** every user-visible change (UI wording and user-facing backend fixes included) adds an
+  entry to the root `CHANGELOG.md` in the same PR: newest date first, plain language, one of **New**,
+  **Improved**, **Fixed** or **Under the hood**, a PR link, no customer details. Internal-only changes
+  (tests, repo instructions) need none. Then run `cd frontend && pnpm exec vitest run src/lib/changelog.test.ts`.
+- **Commits:** `type(scope): concise summary`, one logical change per commit.
+- **Dependencies:** `pnpm install --frozen-lockfile` and `uv sync --frozen`; keep the committed lockfiles.
+- **Production restarts:** only when no tasks are queued or processing and the worker has no jobs running.
 
 ## Environment Variables
 
